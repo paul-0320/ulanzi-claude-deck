@@ -1,0 +1,59 @@
+{
+  "Author": "paul",
+  "Name": "Claude Dials",
+  "Description": "Knobs and keys for the Claude desktop app. Effort Dial moves the effort menu of the current model and confirms 0.5 seconds after the last turn, or when you press the knob. Scroll Dial scrolls the conversation one page per detent. Session Dial moves to the previous or next session, one per detent. Session Key shows one of the eight most recent sessions with its status and context use, flashing while the session waits on a permission or a question; press it to open that session. Usage Key shows this week's plan usage, all models or Fable, as the Claude app last fetched it.",
+  "Icon": "resources/icon.png",
+  "Version": "0.9.0",
+  "UUID": "com.ulanzi.ulanzistudio.claudeeffort",
+  "Type": "JavaScript",
+  "CodePath": "plugin/app.js",
+  "Category": "Claude",
+  "CategoryIcon": "resources/icon.png",
+  "Actions": [
+    {
+      "Name": "Effort Dial",
+      "Icon": "resources/icon.png",
+      "UUID": "com.ulanzi.ulanzistudio.claudeeffort.dial",
+      "Tooltip": "Turn to change Claude's effort; it confirms after 0.5 s",
+      "States": [{ "Name": "Default", "Image": "resources/icon.png" }],
+      "Controllers": ["Encoder"],
+      "SupportedInMultiActions": false
+    },
+    {
+      "Name": "Scroll Dial",
+      "Icon": "resources/icon.png",
+      "UUID": "com.ulanzi.ulanzistudio.claudeeffort.scroll",
+      "Tooltip": "Turn to scroll the Claude conversation, one page per detent",
+      "States": [{ "Name": "Default", "Image": "resources/icon.png" }],
+      "Controllers": ["Encoder"],
+      "SupportedInMultiActions": false
+    },
+    {
+      "Name": "Session Dial",
+      "Icon": "resources/icon.png",
+      "UUID": "com.ulanzi.ulanzistudio.claudeeffort.session",
+      "Tooltip": "Turn to move to the previous or next Claude session",
+      "States": [{ "Name": "Default", "Image": "resources/icon.png" }],
+      "Controllers": ["Encoder"],
+      "SupportedInMultiActions": false
+    },
+    {
+      "Name": "Session Key",
+      "Icon": "resources/icon.png",
+      "UUID": "com.ulanzi.ulanzistudio.claudeeffort.sessionkey",
+      "Tooltip": "One of the eight most recent Claude sessions; press to open it",
+      "States": [{ "Name": "Default", "Image": "resources/icon.png" }],
+      "Controllers": ["Keypad"],
+      "SupportedInMultiActions": false
+    },
+    {
+      "Name": "Usage Key",
+      "Icon": "resources/icon.png",
+      "UUID": "com.ulanzi.ulanzistudio.claudeeffort.usagekey",
+      "Tooltip": "This week's plan usage, all models or Fable, as the Claude app last fetched it",
+      "States": [{ "Name": "Default", "Image": "resources/icon.png" }],
+      "Controllers": ["Keypad"],
+      "SupportedInMultiActions": false
+    }
+  ]
+}
