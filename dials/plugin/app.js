@@ -12,7 +12,6 @@ import { USAGE_WINDOWS, parseWindow } from "./sessions/usage.js";
 
 const PLUGIN_UUID = "com.ulanzi.ulanzistudio.claudeeffort";
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DECKKEYS = join(HERE, "bin", "deckkeys");
 const LOG = join(HERE, "dials.log");
 
 const MENU_OPEN_MS = 200;
@@ -36,7 +35,7 @@ if (!row) {
 }
 const platform = row({ home: homedir(), path: process.env.PATH ?? "" });
 // Tests point this at a recorder; a test that opened a real claude:// link would switch the developer's session.
-const OPEN = process.env.CLAUDE_DECK_OPEN || platform.opener;
+const [OPEN, ...OPEN_ARGS] = process.env.CLAUDE_DECK_OPEN ? [process.env.CLAUDE_DECK_OPEN] : platform.opener;
 
 /**
  * deckkeys, kept running and fed one line at a time. Unavailable for good, with `child` null, when
@@ -95,7 +94,7 @@ class KeySender {
   }
 }
 
-const keys = new KeySender(platform.keySender ? DECKKEYS : null);
+const keys = new KeySender(platform.keySender && join(HERE, "bin", platform.keySender));
 
 const EFFORT_DIAL = `${PLUGIN_UUID}.dial`;
 const EFFORT_MENU_KEY = "cmd+shift+e";
@@ -214,7 +213,7 @@ const deckKeys = new DeckKeys({
   platform,
   paint: (context, image) => $UD.setBaseDataIcon(context, image),
   open: (url) => {
-    const child = spawn(OPEN, [url], { stdio: "ignore", detached: true });
+    const child = spawn(OPEN, [...OPEN_ARGS, url], { stdio: "ignore", detached: true });
     child.on("error", (error) => log("open:", error.message));
     child.unref();
   },

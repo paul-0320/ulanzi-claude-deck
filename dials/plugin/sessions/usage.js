@@ -5,7 +5,7 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import zlib from "node:zlib";
 import { stampOf, statIfExists } from "./files.js";
@@ -130,14 +130,99 @@ export function cacheEntryOf(buffer) {
   // The body's own EOF record leaves its stream_size at 0, so the record is found by its magic.
   const eof = buffer.indexOf(FINAL_MAGIC, keyEnd);
   if (eof === -1) return null;
-  const headers = rawHeaders(buffer.subarray(eof + EOF_SIZE));
-  const date = Date.parse(headers.get("date") ?? "");
   return {
     key: buffer.toString("utf8", HEADER_SIZE, keyEnd),
     body: buffer.subarray(keyEnd, eof),
+    ...responseOf(buffer.subarray(eof + EOF_SIZE)),
+  };
+}
+
+/** @param {Buffer} stream  stream 0, the response info */
+function responseOf(stream) {
+  const headers = rawHeaders(stream);
+  const date = Date.parse(headers.get("date") ?? "");
+  return {
     encoding: headers.get("content-encoding")?.toLowerCase() ?? "identity",
     date: Number.isFinite(date) ? date : null,
   };
+}
+
+// Chromium's blockfile cache, which the Windows build uses. Entries are 256-byte blocks in data_1
+// and the files chained after it; each block file starts with an 8 KB header. An entry points at
+// its streams with cache addresses into data_N block files or f_xxxxxx files.
+const BLOCK_FILE_HEADER = 8192;
+const BLOCK_SIZE_BY_TYPE = [0, 36, 256, 1024, 4096];
+const ENTRY_SIZE = 256;
+const ENTRY_KEY_OFFSET = 96;
+const ENTRY_NORMAL = 0;
+
+/** @param {string} folder  a cache folder; true when it holds a blockfile cache */
+async function isBlockfile(folder) {
+  return (await statIfExists(join(folder, "data_1"))) !== null;
+}
+
+/**
+ * Every normal entry whose key is one of `keys`. A freed entry can keep its bytes in place, so a
+ * key can match more than once; the caller keeps the newest response that decodes.
+ * @param {string} folder
+ * @param {readonly string[]} keys
+ * @returns {Promise<CacheEntry[]>}
+ */
+async function blockfileEntries(folder, keys) {
+  const found = [];
+  const seen = new Set();
+  let number = 1;
+  while (number !== 0 && !seen.has(number)) {
+    seen.add(number);
+    const entries = await readFile(join(folder, `data_${number}`));
+    for (const key of keys) {
+      for (let at = entries.indexOf(key); at !== -1; at = entries.indexOf(key, at + 1)) {
+        const entry = await blockfileEntryAt(folder, entries, at - ENTRY_KEY_OFFSET, key);
+        if (entry) found.push(entry);
+      }
+    }
+    number = entries.readInt16LE(10);
+  }
+  return found;
+}
+
+/**
+ * @returns {Promise<CacheEntry | null>}  null where `start` is not a normal entry for `key`, or
+ *   where its streams are gone, as a stale entry's f_ file can be
+ */
+async function blockfileEntryAt(folder, entries, start, key) {
+  if (start < BLOCK_FILE_HEADER || (start - BLOCK_FILE_HEADER) % ENTRY_SIZE !== 0) return null;
+  if (entries.readInt32LE(start + 32) !== Buffer.byteLength(key) || entries.readInt32LE(start + 20) !== ENTRY_NORMAL) return null;
+  try {
+    const info = await readStream(folder, entries.readUInt32LE(start + 56), entries.readInt32LE(start + 40));
+    const body = await readStream(folder, entries.readUInt32LE(start + 60), entries.readInt32LE(start + 44));
+    return info && body ? { key, body, ...responseOf(info) } : null;
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/** @returns {Promise<Buffer | null>} null for an unset address or one that cannot hold `size` bytes */
+async function readStream(folder, address, size) {
+  if (!(address & 0x80000000) || size <= 0) return null;
+  const type = (address >>> 28) & 7;
+  let path = join(folder, `f_${(address & 0x0fffffff).toString(16).padStart(6, "0")}`);
+  let position = 0;
+  if (type !== 0) {
+    const blockSize = BLOCK_SIZE_BY_TYPE[type];
+    if (!blockSize || size > blockSize * (((address >>> 24) & 3) + 1)) return null;
+    path = join(folder, `data_${(address >>> 16) & 0xff}`);
+    position = BLOCK_FILE_HEADER + (address & 0xffff) * blockSize;
+  }
+  const handle = await open(path, "r");
+  try {
+    const buffer = Buffer.alloc(size);
+    const { bytesRead } = await handle.read(buffer, 0, size, position);
+    return bytesRead === size ? buffer : null;
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -202,6 +287,16 @@ async function usageIn(bytes, url, mtimeMs, zstdClis) {
   const entry = cacheEntryOf(bytes);
   if (!entry) throw new Unreadable("not a finished cache entry");
   if (entry.key !== KEY_PREFIX + url) throw new Unreadable("holds another URL");
+  return usageOfEntry(entry, mtimeMs, zstdClis);
+}
+
+/**
+ * @param {CacheEntry} entry
+ * @param {number} mtimeMs  when the cache wrote it, for a response without a date header
+ * @param {readonly string[]} zstdClis
+ * @returns {Promise<PlanUsage>}
+ */
+async function usageOfEntry(entry, mtimeMs, zstdClis) {
   const decode = DECODERS[entry.encoding];
   if (!decode) throw new Unreadable("unknown content-encoding");
   const usage = planUsageOf(JSON.parse((await decode(entry.body, zstdClis)).toString("utf8")), entry.date ?? mtimeMs);
@@ -213,7 +308,7 @@ export class UsageReader {
   #folder;
   #zstdClis;
   #report;
-  /** @type {Map<string, { stamp: string, usage: PlanUsage }>} the last good parse per cache file name */
+  /** @type {Map<string, { stamp: string, usage: PlanUsage | null }>} the last good parse per cache file name; null where a blockfile cache has no entry */
   #parsed = new Map();
   /** @type {Map<string, string>} the last problem reported per cache file name, so a broken file logs once, not once a second */
   #problems = new Map();
@@ -236,12 +331,52 @@ export class UsageReader {
    * @returns {Promise<PlanUsage | null>}  null with no org or no readable file
    */
   async read(org) {
+    if (org !== null && (await isBlockfile(this.#folder))) return this.#readBlockfile(usageUrls(org));
     let newest = null;
     for (const url of org === null ? [] : usageUrls(org)) {
       const usage = await this.#readFile(cacheFileName(url), url);
       if (usage && (newest === null || usage.fetchedAt > newest.fetchedAt)) newest = usage;
     }
     return newest;
+  }
+
+  /**
+   * The blockfile cache rewrites data_1 whenever any entry changes, so its stamp, with the org,
+   * decides whether to look again. An entry caught mid-write fails to decode and is skipped; with
+   * none decoding, the last good reading stays.
+   * @param {readonly string[]} urls
+   * @returns {Promise<PlanUsage | null>}
+   */
+  async #readBlockfile(urls) {
+    const name = "data_1";
+    try {
+      const stats = await statIfExists(join(this.#folder, name));
+      if (!stats) return null;
+      const stamp = `${stampOf(stats)} ${urls[0]}`;
+      const cached = this.#parsed.get(name);
+      if (cached?.stamp === stamp) return cached.usage;
+      let newest = null;
+      let problem = null;
+      for (const entry of await blockfileEntries(this.#folder, urls.map((url) => KEY_PREFIX + url))) {
+        try {
+          const usage = await usageOfEntry(entry, stats.mtimeMs, this.#zstdClis);
+          if (newest === null || usage.fetchedAt > newest.fetchedAt) newest = usage;
+        } catch (error) {
+          problem ??= error;
+        }
+      }
+      if (newest === null && problem) throw problem;
+      this.#parsed.set(name, { stamp, usage: newest });
+      if (this.#problems.delete(name)) this.#report("usage", `${name} recovered`);
+      return newest;
+    } catch (error) {
+      const problem = `${name} ${error instanceof Unreadable ? error.message : (error.code ?? error.name)}`;
+      if (this.#problems.get(name) !== problem) {
+        this.#problems.set(name, problem);
+        this.#report("usage", problem);
+      }
+      return this.#parsed.get(name)?.usage ?? null;
+    }
   }
 
   /**
