@@ -136,6 +136,12 @@ function cacheFile({ url, json = usageResponse(), encoding = "gzip", date = null
   header.writeUInt32LE(key.length, 12);
   const body = ENCODE[encoding](Buffer.from(typeof json === "string" ? json : JSON.stringify(json)));
   if (!finished) return Buffer.concat([header, key, body]);
+  const info = responseInfo({ date, encoding });
+  return Buffer.concat([header, key, body, eofRecord(0), info, eofRecord(info.length)]);
+}
+
+/** Stream 0 of a cache entry: a pickle holding the raw headers. */
+function responseInfo({ date, encoding }) {
   const lines = [
     "HTTP/1.1 200",
     ...(date === null ? [] : [`date:${new Date(date).toUTCString()}`]),
@@ -145,14 +151,50 @@ function cacheFile({ url, json = usageResponse(), encoding = "gzip", date = null
   const raw = Buffer.from(`${lines.join("\0")}\0\0`, "latin1");
   const length = Buffer.alloc(4);
   length.writeUInt32LE(raw.length);
-  const info = Buffer.concat([Buffer.from([0x4c, 0x02, 0, 0, 0x8c, 0x8d, 0xe0, 0x75, 0x9e, 0xbe, 0x2f, 0]), length, raw]);
-  return Buffer.concat([header, key, body, eofRecord(0), info, eofRecord(info.length)]);
+  return Buffer.concat([Buffer.from([0x4c, 0x02, 0, 0, 0x8c, 0x8d, 0xe0, 0x75, 0x9e, 0xbe, 0x2f, 0]), length, raw]);
+}
+
+/**
+ * Chromium's blockfile cache, as the Windows build writes it, in `folder`: data_1 holds one
+ * 256-byte entry per response after its 8 KB header, each response info sits in 1 KB blocks of
+ * data_2, and each body in its own f_ file. `state` other than 0 marks a freed entry.
+ */
+function writeBlockfile(folder, responses) {
+  const blockFile = (entrySize, blocks) => {
+    const header = Buffer.alloc(8192);
+    header.writeUInt32LE(0xc104cac3, 0);
+    header.writeInt32LE(entrySize, 12);
+    return Buffer.concat([header, ...blocks]);
+  };
+  const entries = [];
+  const infoBlocks = [];
+  for (const [index, { url, json = usageResponse(), encoding = "gzip", date = null, state = 0 }] of responses.entries()) {
+    const key = Buffer.from(`1/0/${url}`);
+    const info = responseInfo({ date, encoding });
+    const body = ENCODE[encoding](Buffer.from(JSON.stringify(json)));
+    const blocks = Math.ceil(info.length / 1024);
+    const infoAddress = (0x80000000 | (3 << 28) | ((blocks - 1) << 24) | (2 << 16) | infoBlocks.length) >>> 0;
+    infoBlocks.push(Buffer.concat([info, Buffer.alloc(blocks * 1024 - info.length)]));
+    writeFileSync(join(folder, `f_${(index + 1).toString(16).padStart(6, "0")}`), body);
+    const entry = Buffer.alloc(256);
+    entry.writeInt32LE(state, 20);
+    entry.writeInt32LE(key.length, 32);
+    entry.writeInt32LE(info.length, 40);
+    entry.writeInt32LE(body.length, 44);
+    entry.writeUInt32LE(infoAddress, 56);
+    entry.writeUInt32LE((0x80000000 | (index + 1)) >>> 0, 60);
+    key.copy(entry, 96);
+    entries.push(entry);
+  }
+  writeFileSync(join(folder, "data_1"), blockFile(256, entries));
+  writeFileSync(join(folder, "data_2"), blockFile(1024, infoBlocks));
 }
 
 /** Where the app keeps its data and its logs under the home folder, spelled out apart from platform.js so a wrong row there fails. */
 const APP_FOLDERS = {
   darwin: { appData: ["Library", "Application Support", "Claude"], logs: ["Library", "Logs", "Claude"] },
   win32: { appData: ["AppData", "Roaming", "Claude"], logs: ["AppData", "Roaming", "Claude", "logs"] },
+  win32Store: { appData: ["AppData", "Local", "Claude-Data", "claude_pzs8sxrjxfjjc"], logs: ["AppData", "Local", "Claude", "logs"] },
 };
 
 /**
@@ -1290,6 +1332,27 @@ describe("usage reader", () => {
     assert.equal(usage.fetchedAt, at(300));
   });
 
+  test("a blockfile cache, the Windows build's, is read too: the org's newest entry wins, and a freed entry, one whose body file is gone, or another org's is skipped", async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "claude-blockfile-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const cache = join(dir, "Cache", "Cache_Data");
+    mkdirSync(cache, { recursive: true });
+    writeBlockfile(cache, [
+      { url: usageUrl("org"), json: usageResponse({ all: 41 }), date: at(100) },
+      { url: usageUrl("org", "?cedar_ember=1&skip_spend=1"), json: usageResponse({ all: 43, fable: 21 }), date: at(300), encoding: "identity" },
+      { url: usageUrl("org", "?skip_spend=1"), json: usageResponse({ all: 99 }), date: at(500), state: 1 },
+      { url: usageUrl("other-org"), json: usageResponse({ all: 90 }), date: at(600) },
+      { url: usageUrl("org", "?at_wall=1&skip_spend=1"), json: usageResponse({ all: 77 }), date: at(700) },
+    ]);
+    rmSync(join(cache, "f_000005"));
+    const reader = new UsageReader({ platform: { appData: dir, zstdClis: [] } });
+    const usage = await reader.read("org");
+    assert.equal(usage.limits.all.percent, 43);
+    assert.equal(usage.limits.fable.percent, 21);
+    assert.equal(usage.fetchedAt, at(300));
+    assert.equal(await reader.read("no-such-org"), null);
+  });
+
   test("a response without a date header was fetched when its file was written", async (t) => {
     const home = await fakeHome(t);
     await home.usage(usageUrl("org"), { mtime: at(42) });
@@ -1383,11 +1446,27 @@ describe("windows", () => {
     assert.equal((await new UsageReader({ platform }).read(facts.org))?.limits.all.percent, 46, "the HTTP cache");
   });
 
-  test("the Windows row opens links with explorer.exe, looks for zstd.exe in each PATH folder, and has no deckkeys", () => {
+  test("with the Store build installed, the readers look under AppData/Local/Claude-Data/claude_* and AppData/Local/Claude/logs", async (t) => {
+    const home = await fakeHome(t, "win32Store");
+    await home.session({ id: localId(1), title: "A", lastActivityAt: at(1) });
+    await home.preferences(sidebarPrefs({ "account/org": { sortBy: "alpha", ascending: false } }));
+    await home.focus(at(10), localId(1));
+    await home.rotateLog();
+    await home.focus(at(30), null);
+    await home.usage(usageUrl("org"), { json: usageResponse({ all: 46 }) });
+    const platform = PLATFORMS.win32({ home: home.home, path: "" });
+    const facts = await readerFor(home.home, { platform }).read();
+    assert.deepEqual(facts.sessions.map(({ id }) => id), [localId(1)], "the session store");
+    assert.deepEqual(facts.order, { by: "alpha", reversed: false }, "the sidebar preferences");
+    assert.equal(facts.sessions[0].seenThrough, at(30) + 999, "selected in main1.log, left in main.log");
+    assert.equal((await new UsageReader({ platform }).read(facts.org))?.limits.all.percent, 46, "the HTTP cache");
+  });
+
+  test("the Windows row opens links with rundll32's URL handler, looks for zstd.exe in each PATH folder, and sends keys with bin/deckkeys.exe", () => {
     const windows = PLATFORMS.win32({ home: "/home", path: "/opt/zstd;;/usr/tools" });
-    assert.equal(windows.opener, "explorer.exe");
-    assert.deepEqual(windows.zstdClis, ["/opt/zstd/zstd.exe", "/usr/tools/zstd.exe"], "an empty PATH entry is skipped");
-    assert.equal(windows.keySender, false);
+    assert.deepEqual(windows.opener, ["rundll32.exe", "url.dll,FileProtocolHandler"]);
+    assert.deepEqual(windows.zstdClis, [join("/opt/zstd", "zstd.exe"), join("/usr/tools", "zstd.exe")], "an empty PATH entry is skipped");
+    assert.equal(windows.keySender, "deckkeys.exe");
   });
 });
 
@@ -1464,7 +1543,8 @@ async function startDeck(t, home, { deckkeys = true } = {}) {
   });
 
   const plugin = spawn(process.execPath, [join(dir, "app.js"), "127.0.0.1", String(host.address().port), "en"], {
-    env: { ...process.env, HOME: home, CLAUDE_DECK_OPEN: join(dir, "open"), DECKKEYS_RECORD: keysRecord, OPEN_RECORD: openRecord },
+    // os.homedir() reads USERPROFILE on Windows and HOME elsewhere.
+    env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_DECK_OPEN: join(dir, "open"), DECKKEYS_RECORD: keysRecord, OPEN_RECORD: openRecord },
     stdio: "ignore",
   });
   const exited = once(plugin, "exit");
